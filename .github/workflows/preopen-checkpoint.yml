@@ -1,0 +1,194 @@
+name: Verify preopen checkpoints on Linux
+
+"on":
+  push:
+    branches:
+      - test/preopen-checkpoint
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: libmdbx ${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "0.14.4"
+            ref: "v0.14.4"
+            sha256: "fb53f23ae6d9ed219b09792b1687b2f48598b95cfd12afb437d9d5e953052c21"
+          - version: "0.14.4.89"
+            ref: "e302152bf2e7993b005c8401b350549dd1a12aad"
+            sha256: "3c48d1bec89153332ecde0dd10618d475f5a81d4dbd09f6c3ffeb5ea3db9d78d"
+          - version: "0.15.0.139"
+            ref: "b5dea3a007eaa4553d67d1a14e3137ff9dc3aad6"
+            sha256: "c1b9d427d66a199d0dcb8d92b05a2a9fbbf8b93a64496eb7a36ca1f0ac640056"
+    steps:
+      - name: Reproduce the failure and check the proposed fix
+        env:
+          MDBX_TEST_VERSION: ${{ matrix.version }}
+          MDBX_TEST_REF: ${{ matrix.ref }}
+          MDBX_TEST_SHA256: ${{ matrix.sha256 }}
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import tempfile
+          import urllib.request
+
+          if not sys.platform.startswith("linux"):
+              raise SystemExit("This check must run on Linux.")
+
+          version = os.environ["MDBX_TEST_VERSION"]
+          revision = os.environ["MDBX_TEST_REF"]
+          expected_hash = os.environ["MDBX_TEST_SHA256"]
+          root = pathlib.Path(tempfile.mkdtemp(prefix="mdbx-preopen-"))
+          url = f"https://codeload.github.com/Mithril-mine/libmdbx/tar.gz/{revision}"
+          print(f"Testing {version} from {revision} without a synthetic boot ID", flush=True)
+          request = urllib.request.Request(url, headers={"User-Agent": "mdbx-preopen-regression"})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              archive = response.read()
+          if hashlib.sha256(archive).hexdigest() != expected_hash:
+              raise SystemExit("Source archive checksum does not match the verified archive.")
+          archive_path = root / "source.tar.gz"
+          archive_path.write_bytes(archive)
+          source = root / "source"
+          source.mkdir()
+          subprocess.run(["tar", "-xzf", str(archive_path), "-C", str(source), "--strip-components=1"], check=True)
+          subprocess.run(["uname", "-srmo"], check=True)
+          subprocess.run(["cc", "--version"], check=True)
+
+          REPRO = r'''#include "mdbx.c"
+
+          #define CHECK(call) do { \
+            const int result = (call); \
+            if (result != MDBX_SUCCESS) { \
+              fprintf(stderr, "%s: %d (%s)\n", #call, result, mdbx_strerror(result)); \
+              return 2; \
+            } \
+          } while (0)
+
+          int main(int argc, char **argv) {
+            if (argc != 2 && argc != 3) {
+              fprintf(stderr, "usage: repro NEW_DATABASE_PATH [--synthetic-boot]\n");
+              return 2;
+            }
+            MDBX_env *env = NULL;
+            MDBX_txn *txn = NULL;
+            MDBX_dbi dbi;
+            CHECK(mdbx_env_create(&env));
+            if (argc == 3) {
+              if (strcmp(argv[2], "--synthetic-boot") != 0)
+                return 2;
+              /* Single-threaded test: set the boot ID before creating any database. */
+              globals.bootid.x = UINT64_C(0x12345678);
+              globals.bootid.y = UINT64_C(0x87654321);
+            }
+            if (!(globals.bootid.x | globals.bootid.y)) {
+              fprintf(stderr, "No boot ID available; use --synthetic-boot for this test.\n");
+              CHECK(mdbx_env_close(env));
+              return 2;
+            }
+            CHECK(mdbx_env_set_geometry(env, 32768 * 64, -1, 512 * 1024 * 1024,
+                                      1024 * 1024, 0, 32768));
+            CHECK(mdbx_env_open(env, argv[1], MDBX_NOSUBDIR | MDBX_EXCLUSIVE, 0600));
+            CHECK(mdbx_txn_begin(env, NULL, MDBX_TXN_READWRITE, &txn));
+            CHECK(mdbx_dbi_open(txn, NULL, 0, &dbi));
+            MDBX_val key = {"durable", 7}, value = {"saved", 5};
+            CHECK(mdbx_put(txn, dbi, &key, &value, 0));
+            CHECK(mdbx_txn_commit(txn));
+
+            CHECK(mdbx_env_set_flags(env, MDBX_SAFE_NOSYNC, true));
+            /* Keep the small relaxed commit weak instead of using write-through. */
+            CHECK(mdbx_env_set_option(env, MDBX_opt_writethrough_threshold, 0));
+            CHECK(mdbx_txn_begin(env, NULL, MDBX_TXN_READWRITE, &txn));
+            key.iov_base = "weak";
+            key.iov_len = 4;
+            CHECK(mdbx_put(txn, dbi, &key, &value, 0));
+            CHECK(mdbx_txn_commit(txn));
+            const troika_t troika = meta_tap(env);
+            const meta_ptr_t recent = meta_recent(env, &troika);
+            const txnid_t durable_txnid = meta_prefer_steady(env, &troika).txnid;
+            if (recent.is_steady || !meta_bootid_match(recent.ptr_c)) {
+              fprintf(stderr, "Fixture did not produce a same-boot weak checkpoint.\n");
+              CHECK(mdbx_env_close(env));
+              return 2;
+            }
+            fprintf(stderr, "fixture: same-boot weak txn=%llu, durable txn=%llu\n",
+                    (unsigned long long)recent.txnid, (unsigned long long)durable_txnid);
+            CHECK(mdbx_env_close_ex(env, true));
+
+            MDBX_envinfo info;
+            const int inspection = mdbx_preopen_snapinfo(argv[1], &info, sizeof(info));
+            fprintf(stderr, "preopen: %d (%s)\n", inspection, mdbx_strerror(inspection));
+            const bool valid_info = inspection == MDBX_SUCCESS &&
+                info.mi_dxb_pagesize == 32768 && info.mi_recent_txnid == durable_txnid;
+
+            CHECK(mdbx_env_create(&env));
+            CHECK(mdbx_env_open(env, argv[1], MDBX_NOSUBDIR | MDBX_EXCLUSIVE, 0));
+            CHECK(mdbx_txn_begin(env, NULL, MDBX_TXN_RDONLY, &txn));
+            CHECK(mdbx_dbi_open(txn, NULL, 0, &dbi));
+            key.iov_base = "durable";
+            key.iov_len = 7;
+            CHECK(mdbx_get(txn, dbi, &key, &value));
+            const bool valid_value = value.iov_len == 5 && memcmp(value.iov_base, "saved", 5) == 0;
+            CHECK(mdbx_txn_abort(txn));
+            CHECK(mdbx_env_close(env));
+            fprintf(stderr, "normal writable reopen: durable value %s\n", valid_value ? "present" : "wrong");
+            return valid_info && valid_value ? 0 : 1;
+          }
+          '''
+          repro_path = root / "repro.c"
+          repro_path.write_text(REPRO)
+          engine_path = source / "mdbx.c"
+          original = engine_path.read_text()
+          old = "else if (meta_bootid_match(meta))"
+          new = "else if (meta_bootid_match(meta) && meta_weak_acceptable(env, meta, lck_exclusive))"
+          if original.count(old) != 1:
+              raise SystemExit("The expected selection condition has changed; inspect upstream before proceeding.")
+
+          for phase in ["original", "patched"]:
+              if phase == "patched":
+                  engine_path.write_text(original.replace(old, new))
+              binary = root / ("repro-" + phase)
+              command = [
+                  "cc", "-std=c11", "-O1", "-g", "-pthread",
+                  "-DMDBX_TXN_CHECKOWNER=1", "-DMDBX_NOSUCCESS_PURE_COMMIT=0",
+                  '-DMDBX_BUILD_FLAGS="checkpoint regression"',
+                  "-I", str(source), str(repro_path), "-o", str(binary),
+              ]
+              print(f"\n=== {version}: {phase} ===", flush=True)
+              subprocess.run(command, check=True)
+              # The second argument is a fresh path. No boot-ID override is passed.
+              result = subprocess.run(
+                  [str(binary), str(root / (phase + ".mdbx"))],
+                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+              )
+              print(result.stdout, flush=True)
+              (root / (phase + ".log")).write_text(result.stdout)
+              expected_status = 1 if phase == "original" else 0
+              expected_output = "preopen: -30796 (MDBX_CORRUPTED" if phase == "original" else "preopen: 0 (MDBX_SUCCESS"
+              if (result.returncode != expected_status or expected_output not in result.stdout
+                      or "normal writable reopen: durable value present" not in result.stdout):
+                  raise SystemExit(f"Unexpected {phase} result (exit {result.returncode}); do not claim reproduction passed.")
+
+          summary = (
+              f"## {version}\n\n"
+              "Linux run using the native boot ID; no synthetic override.\n\n"
+              "- Original source: preopen returned MDBX_CORRUPTED; normal writable reopen read the durable value.\n"
+              "- Proposed patch: preopen succeeded; normal writable reopen read the durable value.\n"
+              "- Green means both expected results were verified, including reproduction of the original failure.\n"
+          )
+          print(summary, flush=True)
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a") as output:
+                  output.write(summary)
+          PYTHON
